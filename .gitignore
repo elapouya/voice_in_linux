@@ -4,6 +4,9 @@ voice_in
 # whisper.cpp (cloned at build time via make setup)
 whisper.cpp/
 
+# vendored portaudio.h (fetched on first make build)
+vendor/
+
 # Logs
 *.log
 *.log.old

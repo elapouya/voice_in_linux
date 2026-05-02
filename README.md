@@ -19,6 +19,10 @@ Built with the help of AI.
 
 ## How It Works
 
+Two ways to dictate, available simultaneously:
+
+### Tray icon mode — toggle, copy to clipboard
+
 1. A small icon appears in your system tray
 2. **Left-click** → recording starts (icon turns red)
 3. **Left-click again** → recording stops, audio is transcribed locally via Whisper
@@ -27,6 +31,14 @@ Built with the help of AI.
 6. Paste anywhere with `Ctrl+Shift+V`, `Shift+Insert`, or middle-click
 
 **Right-click** the icon for a menu with Toggle / Quit.
+
+### Push-to-talk mode — hold a hotkey, type at the cursor
+
+1. **Hold `Ctrl+Shift+Space`** → recording starts (icon turns red)
+2. **Release the keys** → recording stops, audio is transcribed
+3. The transcribed text is **typed directly at the keyboard cursor** (via `xdotool`) into whichever window has focus
+
+The hotkey is configurable via `VOICE_IN_PTT_HOTKEY` (see [Configuration](#configuration)).
 
 ### Screenshots
 
@@ -51,6 +63,7 @@ Built with the help of AI.
 - **99 languages** — powered by OpenAI Whisper (French, English, German, Chinese, Japanese, Spanish, Italian, and many more)
 - **Lightweight** — single C binary (~100 KB), no Python, no runtime dependencies
 - **System tray integration** — unobtrusive icon in your taskbar
+- **Push-to-talk hotkey** — hold `Ctrl+Shift+Space` (configurable) to record, release to type the transcript at the keyboard cursor
 - **Dual clipboard** — text is pushed to both PRIMARY and CLIPBOARD X11 selections
 - **Desktop notifications** — transcribed text displayed as a notification
 - **Voice commands** — built-in French commands for punctuation and formatting, disabled by default (`VOICE_IN_COMMANDS=1` to enable, see [Voice Commands](#voice-commands))
@@ -86,14 +99,18 @@ Built with the help of AI.
 |---|---|---|---|
 | libgtk-3-dev | 3.22+ | `pkg-config --modversion gtk+-3.0` | `sudo apt install libgtk-3-dev` |
 | libnotify-dev | 0.7+ | `pkg-config --modversion libnotify` | `sudo apt install libnotify-dev` |
-| libportaudio-dev | 19.6+ | `pkg-config --modversion portaudio-2.0` | `sudo apt install libportaudio-dev` |
+| libportaudio2 | 19.6+ | `dpkg -s libportaudio2 \| grep Version` | `sudo apt install libportaudio2` |
 | libcairo2-dev | 1.14+ | `pkg-config --modversion cairo` | `sudo apt install libcairo2-dev` |
+| libx11-dev | 1.6+ | `pkg-config --modversion x11` | `sudo apt install libx11-dev` |
+
+> **Note on PortAudio:** we use the runtime package `libportaudio2` rather than `libportaudio-dev`. On multiarch Debian/Ubuntu systems running wine, installing `libportaudio-dev` can force the removal of i386 packages (`libasound2-plugins:i386`, `libjack-jackd2-0:i386`, `wine-devel`, …). The build vendors `portaudio.h` (fetched once via `curl` on first `make`) and links directly against `libportaudio.so.2`, so the dev package is never needed.
 
 ### Runtime Tools (required)
 
 | Tool | Purpose | Install |
 |---|---|---|
 | xclip | Copy to X11 clipboards | `sudo apt install xclip` |
+| xdotool | Type transcript at cursor (push-to-talk mode) | `sudo apt install xdotool` |
 | notify-send | Desktop notifications | `sudo apt install libnotify-bin` |
 
 ### NVIDIA GPU (optional but critical for performance)
@@ -135,9 +152,9 @@ sudo reboot
 ```bash
 sudo apt update
 sudo apt install -y \
-    build-essential cmake pkg-config git \
-    libgtk-3-dev libnotify-dev libportaudio-dev libcairo2-dev \
-    xclip libnotify-bin
+    build-essential cmake pkg-config git curl \
+    libgtk-3-dev libnotify-dev libportaudio2 libcairo2-dev libx11-dev \
+    xclip xdotool libnotify-bin
 ```
 
 ### Step 2 — Clone this repository
@@ -191,6 +208,7 @@ All configuration is done through environment variables (all optional):
 | `VOICE_IN_COMMANDS` | `0` (disabled) | Set to `1` to enable voice commands |
 | `VOICE_IN_CMDS_FILE` | `commands/<lang>.txt` | Explicit path to a commands file |
 | `VOICE_IN_NOTIFY_PERSIST` | `0` (transient) | Set to `1` to keep notifications in history |
+| `VOICE_IN_PTT_HOTKEY` | `ctrl+shift+space` | Push-to-talk hotkey (e.g. `super+space`, `ctrl+alt+f1`) |
 
 Examples:
 
@@ -205,6 +223,22 @@ VOICE_IN_COMMANDS=1 VOICE_IN_CMDS_FILE=~/my_commands.txt ./voice_in
 ### Notifications
 
 By default, notifications are **transient**: they appear for 10 seconds then vanish completely, leaving no trace in the notification center. Set `VOICE_IN_NOTIFY_PERSIST=1` if you prefer notifications to remain in the history.
+
+### Push-to-talk hotkey
+
+Hold the configured hotkey to record, release to type the transcript at the keyboard cursor. The default is `ctrl+shift+space`. Override it with `VOICE_IN_PTT_HOTKEY`:
+
+```bash
+VOICE_IN_PTT_HOTKEY=super+space ./voice_in
+VOICE_IN_PTT_HOTKEY=ctrl+alt+f1 ./voice_in
+```
+
+**Format**: `mod+mod+...+key`, separated by `+`, case-insensitive.
+
+- Modifiers: `ctrl`, `shift`, `alt`, `super`
+- Key: any X11 keysym name (`space`, `f1`, `a`, `Return`, …)
+
+If the hotkey is invalid, already grabbed by another application, or `xdotool` is not installed, push-to-talk is silently disabled and the tray icon mode keeps working normally.
 
 ### Voice Commands
 

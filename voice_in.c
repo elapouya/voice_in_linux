@@ -4,10 +4,15 @@
  *
  * Copyright (C) 2026 Olivier Pons
  *
- * Left-click the tray icon to toggle recording. Audio is captured via
- * PortAudio, transcribed locally with whisper.cpp, pushed to both X11
- * selections (PRIMARY + CLIPBOARD) via xclip, and shown as a desktop
- * notification through libnotify.
+ * Two activation modes:
+ *   1. Tray icon (toggle): left-click starts recording, click again
+ *      stops it. Transcript is copied to PRIMARY + CLIPBOARD via xclip.
+ *   2. Push-to-talk hotkey: hold the configured key combo (default
+ *      ctrl+shift+space) to record, release to stop. Transcript is
+ *      typed at the keyboard cursor via xdotool.
+ *
+ * Audio is captured via PortAudio, transcribed locally with
+ * whisper.cpp, and shown as a desktop notification through libnotify.
  *
  * Environment variables:
  *   VOICE_IN_MODEL       path to ggml model
@@ -16,6 +21,8 @@
  *   VOICE_IN_COMMANDS        "1" to enable voice commands
  *   VOICE_IN_CMDS_FILE       explicit path to commands file
  *   VOICE_IN_NOTIFY_PERSIST  "1" to keep notifications in history
+ *   VOICE_IN_PTT_HOTKEY      push-to-talk hotkey spec, e.g.
+ *                            "ctrl+shift+space" (default), "super+space"
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -34,8 +41,12 @@
 #include <unistd.h>
 
 #include <gtk/gtk.h>
+#include <gdk/gdkx.h>
 #include <libnotify/notify.h>
 #include <portaudio.h>
+#include <X11/Xlib.h>
+#include <X11/XKBlib.h>
+#include <X11/keysym.h>
 
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
@@ -62,6 +73,8 @@
 #define DEFAULT_MODEL       "whisper.cpp/models/ggml-medium.bin"
 #define DEFAULT_LANG        "fr"
 #define CMDS_DIR            "commands"
+#define DEFAULT_PTT_HOTKEY  "ctrl+shift+space"
+#define HOTKEY_TOKENS_MAX   8
 
 /* ---- types ---- */
 
@@ -103,6 +116,11 @@ struct app {
     int                     cmd_count;
     int                     cmd_cap;
     _Atomic enum app_state  state;
+    Display                 *xdpy;
+    unsigned int            ptt_mods;
+    unsigned int            ptt_keycode;
+    bool                    ptt_grabbed;
+    bool                    via_hotkey;
 };
 
 /* ---- static prototypes ---- */
@@ -115,6 +133,8 @@ static void request_state(enum app_state state);
 static void copy_to_selection(const char *text,
                               const char *sel);
 static void copy_to_clipboards(const char *text);
+static void wait_for_ptt_keys_released(void);
+static void type_text(const char *text);
 static gboolean notify_cb(gpointer data);
 static void request_notify(const char *title,
                            const char *body);
@@ -151,10 +171,51 @@ static void init_device(void);
 static void init_options(void);
 static void build_menu(void);
 static void build_tray(void);
+static int parse_hotkey(const char *spec, unsigned int *mods,
+                        KeySym *ks);
+static int x_silent_error_handler(Display *dpy, XErrorEvent *ev);
+static void grab_hotkey_combo(unsigned int extra);
+static void init_hotkey(void);
+static GdkFilterReturn ptt_event_filter(GdkXEvent *xev,
+                                        GdkEvent *gev,
+                                        gpointer data);
 
 /* ---- global state ---- */
 
 static struct app g_app;
+
+/* ---- debug helpers ---- */
+
+/*
+ * ptt_debug_enabled - True when VOICE_IN_DEBUG_PTT=1 in env.
+ * Cached after first call to avoid repeated getenv() in the X
+ * event filter hot path.
+ */
+static int ptt_debug_enabled(void)
+{
+    static int cached = -1;
+    const char *v;
+
+    if (cached < 0) {
+        v = getenv("VOICE_IN_DEBUG_PTT");
+        cached = (v && *v == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static double ptt_dbg_ts(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+#define PTT_DBG(fmt, ...) do {                                  \
+    if (ptt_debug_enabled())                                    \
+        fprintf(stderr, "[ptt %.3f] " fmt "\n",                 \
+                ptt_dbg_ts(), ##__VA_ARGS__);                   \
+} while (0)
 
 /* ---- icons ---- */
 
@@ -275,6 +336,97 @@ static void copy_to_clipboards(const char *text)
 {
     copy_to_selection(text, "primary");
     copy_to_selection(text, "clipboard");
+}
+
+/**
+ * wait_for_ptt_keys_released - Block until PTT mods + key are up.
+ *
+ * Avoids a race with xdotool --clearmodifiers: if we type while
+ * the user still holds Ctrl/Shift, xdotool synthesizes mod
+ * releases at start and re-presses them at end. If the user
+ * releases physically *during* typing, X ends up thinking the
+ * mods are stuck pressed — subsequent keystrokes get prefixed
+ * with phantom Ctrl/Shift, which breaks input in TUI apps like
+ * Claude Code.
+ *
+ * Polls every 10 ms up to ~2 s. Runs on the transcription worker
+ * thread, so opens its own Xlib display to avoid concurrent use
+ * of g_app.xdpy (owned by the GTK main thread).
+ */
+static void wait_for_ptt_keys_released(void)
+{
+    Display *dpy;
+    XkbStateRec state;
+    char keymap[32];
+    int waited_ms = 0;
+    const int timeout_ms = 2000;
+    const int poll_ms = 10;
+    int kc;
+    bool held;
+    struct timespec ts;
+
+    if (!g_app.ptt_grabbed)
+        return;
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        PTT_DBG("wait_keys: XOpenDisplay failed");
+        return;
+    }
+    kc = (int)g_app.ptt_keycode;
+    held = false;
+    ts.tv_sec = 0;
+    ts.tv_nsec = poll_ms * 1000000L;
+    while (waited_ms < timeout_ms) {
+        held = false;
+        if (XkbGetState(dpy, XkbUseCoreKbd, &state) == Success
+            && (state.mods & g_app.ptt_mods) != 0)
+            held = true;
+        if (!held && kc > 0) {
+            XQueryKeymap(dpy, keymap);
+            if (keymap[kc / 8] & (1 << (kc % 8)))
+                held = true;
+        }
+        if (!held)
+            break;
+        nanosleep(&ts, NULL);
+        waited_ms += poll_ms;
+    }
+    PTT_DBG("wait_keys: waited=%dms still_held=%d",
+            waited_ms, held);
+    XCloseDisplay(dpy);
+}
+
+/**
+ * type_text - Synthesize keystrokes for @text via xdotool.
+ * @text: NUL-terminated string to type at the keyboard cursor.
+ *
+ * Calls wait_for_ptt_keys_released() first so the user has time
+ * to lift Ctrl/Shift after the push-to-talk hotkey. --clearmodifiers
+ * is kept as a belt-and-suspenders fallback if the wait times out.
+ */
+static void type_text(const char *text)
+{
+    pid_t pid;
+    int status;
+
+    if (!text || !*text)
+        return;
+    wait_for_ptt_keys_released();
+    pid = fork();
+    if (pid < 0)
+        return;
+    if (pid == 0) {
+        execlp("xdotool", "xdotool", "type",
+               "--clearmodifiers", "--delay", "1",
+               "--", text, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0)
+        return;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+        fprintf(stderr,
+                "type: xdotool not found "
+                "(install with: sudo apt install xdotool)\n");
 }
 
 static gboolean notify_cb(gpointer data)
@@ -697,6 +849,7 @@ static void *transcribe_thread(void *arg)
     n = atomic_load(&g_app.audio_len);
     if (n < MIN_AUDIO_SAMPLES) {
         request_notify("VoiceIn", "Empty recording");
+        g_app.via_hotkey = false;
         request_state(STATE_IDLE);
         return NULL;
     }
@@ -713,6 +866,7 @@ static void *transcribe_thread(void *arg)
     if (!raw || !*raw) {
         free(raw);
         request_notify("VoiceIn", "No speech detected");
+        g_app.via_hotkey = false;
         request_state(STATE_IDLE);
         return NULL;
     }
@@ -724,12 +878,17 @@ static void *transcribe_thread(void *arg)
     }
     capitalize_sentences(text);
     if (text && *text) {
-        copy_to_clipboards(text);
-        request_notify("VoiceIn", text);
+        if (g_app.via_hotkey) {
+            type_text(text);
+        } else {
+            copy_to_clipboards(text);
+            request_notify("VoiceIn", text);
+        }
     } else {
         request_notify("VoiceIn", "No speech detected");
     }
     free(text);
+    g_app.via_hotkey = false;
     request_state(STATE_IDLE);
     return NULL;
 }
@@ -738,6 +897,7 @@ static void *transcribe_thread(void *arg)
 
 static void rec_start(void)
 {
+    PTT_DBG("rec_start called via_hotkey=%d", g_app.via_hotkey);
     if (audio_start() != 0) {
         request_notify("VoiceIn",
                        "Mic error: cannot open stream");
@@ -750,6 +910,7 @@ static void rec_stop(void)
 {
     pthread_t tid;
 
+    PTT_DBG("rec_stop called via_hotkey=%d", g_app.via_hotkey);
     audio_stop();
     set_state(STATE_PROCESSING);
     if (pthread_create(&tid, NULL,
@@ -798,6 +959,220 @@ static void on_popup(GtkStatusIcon *icon, guint btn,
     (void)time;
     (void)data;
     gtk_menu_popup_at_pointer(GTK_MENU(g_app.menu), NULL);
+}
+
+/* ---- push-to-talk hotkey ---- */
+
+/**
+ * parse_hotkey - Decode "ctrl+shift+space" into modifiers + keysym.
+ * @spec: hotkey description, tokens separated by '+', case-insensitive.
+ * @mods: out, X11 modifier mask.
+ * @ks:   out, X11 keysym.
+ *
+ * The last token is the key (resolved via XStringToKeysym, trying
+ * the lowercase form first, then the original spelling). All other
+ * tokens are modifiers: ctrl, shift, alt, super.
+ *
+ * Return: 0 on success, -1 if @spec is malformed or the key is
+ * unknown.
+ */
+static int parse_hotkey(const char *spec, unsigned int *mods,
+                        KeySym *ks)
+{
+    char buf[128];
+    char *tokens[HOTKEY_TOKENS_MAX];
+    int n_tokens = 0;
+    char *p;
+    char *save;
+    const char *key_token;
+    int i;
+
+    if (!spec || !*spec)
+        return -1;
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    str_lower_ascii(buf);
+    for (p = strtok_r(buf, "+", &save); p;
+         p = strtok_r(NULL, "+", &save)) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (n_tokens >= HOTKEY_TOKENS_MAX)
+            return -1;
+        tokens[n_tokens++] = p;
+    }
+    if (n_tokens == 0)
+        return -1;
+    *mods = 0;
+    for (i = 0; i < n_tokens - 1; i++) {
+        if (strcmp(tokens[i], "ctrl") == 0 ||
+            strcmp(tokens[i], "control") == 0)
+            *mods |= ControlMask;
+        else if (strcmp(tokens[i], "shift") == 0)
+            *mods |= ShiftMask;
+        else if (strcmp(tokens[i], "alt") == 0 ||
+                 strcmp(tokens[i], "mod1") == 0)
+            *mods |= Mod1Mask;
+        else if (strcmp(tokens[i], "super") == 0 ||
+                 strcmp(tokens[i], "win") == 0 ||
+                 strcmp(tokens[i], "mod4") == 0)
+            *mods |= Mod4Mask;
+        else
+            return -1;
+    }
+    key_token = tokens[n_tokens - 1];
+    *ks = XStringToKeysym(key_token);
+    if (*ks == NoSymbol && key_token[0]) {
+        char cap[64];
+        strncpy(cap, key_token, sizeof(cap) - 1);
+        cap[sizeof(cap) - 1] = '\0';
+        if (cap[0] >= 'a' && cap[0] <= 'z')
+            cap[0] = (char)(cap[0] - ('a' - 'A'));
+        *ks = XStringToKeysym(cap);
+    }
+    if (*ks == NoSymbol)
+        return -1;
+    return 0;
+}
+
+/*
+ * Silent X error handler installed during XGrabKey calls. Some
+ * hotkeys may already be grabbed by the window manager (BadAccess);
+ * we want to log a warning later, not abort. Returning 0 from an
+ * X error handler tells Xlib to swallow the error.
+ */
+static int x_silent_error_handler(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    (void)ev;
+    return 0;
+}
+
+/**
+ * grab_hotkey_combo - Grab the configured key with one mod overlay.
+ * @extra: extra modifier bits to OR into the base modifier mask
+ * (typically combinations of LockMask and Mod2Mask, so the grab
+ * still triggers when CapsLock or NumLock is on).
+ */
+static void grab_hotkey_combo(unsigned int extra)
+{
+    XGrabKey(g_app.xdpy, (int)g_app.ptt_keycode,
+             g_app.ptt_mods | extra,
+             DefaultRootWindow(g_app.xdpy),
+             True, GrabModeAsync, GrabModeAsync);
+}
+
+/**
+ * init_hotkey - Parse VOICE_IN_PTT_HOTKEY, grab it on the X root.
+ *
+ * Failures are non-fatal: if parsing fails, the variable is unset
+ * to a non-empty bogus value, or the key is already grabbed by
+ * another client, push-to-talk is silently disabled and the tray
+ * mode keeps working.
+ */
+static void init_hotkey(void)
+{
+    const char *spec;
+    KeySym ks;
+    int (*old_handler)(Display *, XErrorEvent *);
+
+    spec = getenv("VOICE_IN_PTT_HOTKEY");
+    if (!spec || !*spec)
+        spec = DEFAULT_PTT_HOTKEY;
+    if (parse_hotkey(spec, &g_app.ptt_mods, &ks) != 0) {
+        fprintf(stderr,
+                "ptt: invalid hotkey '%s', "
+                "push-to-talk disabled\n", spec);
+        return;
+    }
+    g_app.xdpy = gdk_x11_get_default_xdisplay();
+    if (!g_app.xdpy) {
+        fprintf(stderr,
+                "ptt: no X display, "
+                "push-to-talk disabled\n");
+        return;
+    }
+    g_app.ptt_keycode =
+        (unsigned int)XKeysymToKeycode(g_app.xdpy, ks);
+    if (g_app.ptt_keycode == 0) {
+        fprintf(stderr,
+                "ptt: keysym has no keycode, "
+                "push-to-talk disabled\n");
+        return;
+    }
+    /*
+     * Disable auto-repeat fake KeyRelease/KeyPress pairs while the
+     * hotkey is held, so we get a single KeyPress and a single
+     * KeyRelease per actual press/release cycle.
+     */
+    XkbSetDetectableAutoRepeat(g_app.xdpy, True, NULL);
+    XSync(g_app.xdpy, False);
+    old_handler = XSetErrorHandler(x_silent_error_handler);
+    grab_hotkey_combo(0);
+    grab_hotkey_combo(LockMask);
+    grab_hotkey_combo(Mod2Mask);
+    grab_hotkey_combo(LockMask | Mod2Mask);
+    XSync(g_app.xdpy, False);
+    XSetErrorHandler(old_handler);
+    g_app.ptt_grabbed = true;
+    gdk_window_add_filter(NULL, ptt_event_filter, NULL);
+    fprintf(stderr, "ptt: hotkey '%s' active\n", spec);
+    PTT_DBG("init: keycode=%u ptt_mods=0x%x debug=on",
+            g_app.ptt_keycode, g_app.ptt_mods);
+}
+
+/*
+ * GDK event filter: peek at every X event delivered to this client
+ * and react to KeyPress/KeyRelease for the grabbed hotkey. We
+ * mask out LockMask/Mod2Mask before comparing modifiers so the
+ * filter matches regardless of CapsLock or NumLock state.
+ */
+static GdkFilterReturn ptt_event_filter(GdkXEvent *xev,
+                                        GdkEvent *gev,
+                                        gpointer data)
+{
+    XEvent *e = xev;
+    unsigned int mods;
+    enum app_state s;
+
+    (void)gev;
+    (void)data;
+    if (!g_app.ptt_grabbed)
+        return GDK_FILTER_CONTINUE;
+    if (e->type != KeyPress && e->type != KeyRelease)
+        return GDK_FILTER_CONTINUE;
+    s = atomic_load(&g_app.state);
+    mods = e->xkey.state & ~(LockMask | Mod2Mask);
+    PTT_DBG("evt %s kc=%u(ptt=%u kc_match=%d) raw_state=0x%x "
+            "mods=0x%x ptt_mods=0x%x mods_match=%d "
+            "app_state=%d via_hk=%d",
+            e->type == KeyPress ? "KP" : "KR",
+            e->xkey.keycode, g_app.ptt_keycode,
+            e->xkey.keycode == g_app.ptt_keycode,
+            e->xkey.state, mods, g_app.ptt_mods,
+            mods == g_app.ptt_mods,
+            (int)s, g_app.via_hotkey);
+    if (e->xkey.keycode != g_app.ptt_keycode)
+        return GDK_FILTER_CONTINUE;
+    if (mods != g_app.ptt_mods) {
+        PTT_DBG("  -> dropped (mods mismatch)");
+        return GDK_FILTER_CONTINUE;
+    }
+    if (e->type == KeyPress) {
+        if (s == STATE_IDLE) {
+            g_app.via_hotkey = true;
+            rec_start();
+        } else {
+            PTT_DBG("  -> KP ignored (state != IDLE)");
+        }
+    } else {
+        if (s == STATE_RECORDING && g_app.via_hotkey) {
+            rec_stop();
+        } else {
+            PTT_DBG("  -> KR ignored (state=%d via_hk=%d)",
+                    (int)s, g_app.via_hotkey);
+        }
+    }
+    return GDK_FILTER_REMOVE;
 }
 
 /* ---- initialization ---- */
@@ -934,6 +1309,7 @@ int main(int argc, char **argv)
     }
     build_menu();
     build_tray();
+    init_hotkey();
     gtk_main();
 
     /* shutdown */
