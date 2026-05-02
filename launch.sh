@@ -3,8 +3,6 @@
 # Keeps voice_in.log (current) + voice_in.log.old (previous).
 # Rotates when the current log exceeds 5 MB.
 
-cd /home/olivier/voice_in_linux
-
 LOG="voice_in.log"
 MAX_BYTES=5242880  # 5 MB
 
@@ -14,4 +12,6 @@ fi
 
 echo "=== voice_in started at $(date) ===" >> "$LOG"
 export VOICE_IN_COMMANDS=1
+export VOICE_IN_MODEL=whisper.cpp/models/ggml-large-v3-turbo.bin
+export VOICE_IN_PTT_HOTKEY=Pause
 exec ./voice_in 2>>"$LOG"

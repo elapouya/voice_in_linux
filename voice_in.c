@@ -133,6 +133,7 @@ static void request_state(enum app_state state);
 static void copy_to_selection(const char *text,
                               const char *sel);
 static void copy_to_clipboards(const char *text);
+static void wait_for_ptt_keys_released(void);
 static void type_text(const char *text);
 static gboolean notify_cb(gpointer data);
 static void request_notify(const char *title,
@@ -182,6 +183,39 @@ static GdkFilterReturn ptt_event_filter(GdkXEvent *xev,
 /* ---- global state ---- */
 
 static struct app g_app;
+
+/* ---- debug helpers ---- */
+
+/*
+ * ptt_debug_enabled - True when VOICE_IN_DEBUG_PTT=1 in env.
+ * Cached after first call to avoid repeated getenv() in the X
+ * event filter hot path.
+ */
+static int ptt_debug_enabled(void)
+{
+    static int cached = -1;
+    const char *v;
+
+    if (cached < 0) {
+        v = getenv("VOICE_IN_DEBUG_PTT");
+        cached = (v && *v == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static double ptt_dbg_ts(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+#define PTT_DBG(fmt, ...) do {                                  \
+    if (ptt_debug_enabled())                                    \
+        fprintf(stderr, "[ptt %.3f] " fmt "\n",                 \
+                ptt_dbg_ts(), ##__VA_ARGS__);                   \
+} while (0)
 
 /* ---- icons ---- */
 
@@ -305,11 +339,70 @@ static void copy_to_clipboards(const char *text)
 }
 
 /**
+ * wait_for_ptt_keys_released - Block until PTT mods + key are up.
+ *
+ * Avoids a race with xdotool --clearmodifiers: if we type while
+ * the user still holds Ctrl/Shift, xdotool synthesizes mod
+ * releases at start and re-presses them at end. If the user
+ * releases physically *during* typing, X ends up thinking the
+ * mods are stuck pressed — subsequent keystrokes get prefixed
+ * with phantom Ctrl/Shift, which breaks input in TUI apps like
+ * Claude Code.
+ *
+ * Polls every 10 ms up to ~2 s. Runs on the transcription worker
+ * thread, so opens its own Xlib display to avoid concurrent use
+ * of g_app.xdpy (owned by the GTK main thread).
+ */
+static void wait_for_ptt_keys_released(void)
+{
+    Display *dpy;
+    XkbStateRec state;
+    char keymap[32];
+    int waited_ms = 0;
+    const int timeout_ms = 2000;
+    const int poll_ms = 10;
+    int kc;
+    bool held;
+    struct timespec ts;
+
+    if (!g_app.ptt_grabbed)
+        return;
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        PTT_DBG("wait_keys: XOpenDisplay failed");
+        return;
+    }
+    kc = (int)g_app.ptt_keycode;
+    held = false;
+    ts.tv_sec = 0;
+    ts.tv_nsec = poll_ms * 1000000L;
+    while (waited_ms < timeout_ms) {
+        held = false;
+        if (XkbGetState(dpy, XkbUseCoreKbd, &state) == Success
+            && (state.mods & g_app.ptt_mods) != 0)
+            held = true;
+        if (!held && kc > 0) {
+            XQueryKeymap(dpy, keymap);
+            if (keymap[kc / 8] & (1 << (kc % 8)))
+                held = true;
+        }
+        if (!held)
+            break;
+        nanosleep(&ts, NULL);
+        waited_ms += poll_ms;
+    }
+    PTT_DBG("wait_keys: waited=%dms still_held=%d",
+            waited_ms, held);
+    XCloseDisplay(dpy);
+}
+
+/**
  * type_text - Synthesize keystrokes for @text via xdotool.
  * @text: NUL-terminated string to type at the keyboard cursor.
  *
- * Uses --clearmodifiers so any modifier still held when the user
- * releases the push-to-talk hotkey doesn't pollute the typed output.
+ * Calls wait_for_ptt_keys_released() first so the user has time
+ * to lift Ctrl/Shift after the push-to-talk hotkey. --clearmodifiers
+ * is kept as a belt-and-suspenders fallback if the wait times out.
  */
 static void type_text(const char *text)
 {
@@ -318,6 +411,7 @@ static void type_text(const char *text)
 
     if (!text || !*text)
         return;
+    wait_for_ptt_keys_released();
     pid = fork();
     if (pid < 0)
         return;
@@ -803,6 +897,7 @@ static void *transcribe_thread(void *arg)
 
 static void rec_start(void)
 {
+    PTT_DBG("rec_start called via_hotkey=%d", g_app.via_hotkey);
     if (audio_start() != 0) {
         request_notify("VoiceIn",
                        "Mic error: cannot open stream");
@@ -815,6 +910,7 @@ static void rec_stop(void)
 {
     pthread_t tid;
 
+    PTT_DBG("rec_stop called via_hotkey=%d", g_app.via_hotkey);
     audio_stop();
     set_state(STATE_PROCESSING);
     if (pthread_create(&tid, NULL,
@@ -1020,6 +1116,8 @@ static void init_hotkey(void)
     g_app.ptt_grabbed = true;
     gdk_window_add_filter(NULL, ptt_event_filter, NULL);
     fprintf(stderr, "ptt: hotkey '%s' active\n", spec);
+    PTT_DBG("init: keycode=%u ptt_mods=0x%x debug=on",
+            g_app.ptt_keycode, g_app.ptt_mods);
 }
 
 /*
@@ -1042,20 +1140,37 @@ static GdkFilterReturn ptt_event_filter(GdkXEvent *xev,
         return GDK_FILTER_CONTINUE;
     if (e->type != KeyPress && e->type != KeyRelease)
         return GDK_FILTER_CONTINUE;
+    s = atomic_load(&g_app.state);
+    mods = e->xkey.state & ~(LockMask | Mod2Mask);
+    PTT_DBG("evt %s kc=%u(ptt=%u kc_match=%d) raw_state=0x%x "
+            "mods=0x%x ptt_mods=0x%x mods_match=%d "
+            "app_state=%d via_hk=%d",
+            e->type == KeyPress ? "KP" : "KR",
+            e->xkey.keycode, g_app.ptt_keycode,
+            e->xkey.keycode == g_app.ptt_keycode,
+            e->xkey.state, mods, g_app.ptt_mods,
+            mods == g_app.ptt_mods,
+            (int)s, g_app.via_hotkey);
     if (e->xkey.keycode != g_app.ptt_keycode)
         return GDK_FILTER_CONTINUE;
-    mods = e->xkey.state & ~(LockMask | Mod2Mask);
-    if (mods != g_app.ptt_mods)
+    if (mods != g_app.ptt_mods) {
+        PTT_DBG("  -> dropped (mods mismatch)");
         return GDK_FILTER_CONTINUE;
-    s = atomic_load(&g_app.state);
+    }
     if (e->type == KeyPress) {
         if (s == STATE_IDLE) {
             g_app.via_hotkey = true;
             rec_start();
+        } else {
+            PTT_DBG("  -> KP ignored (state != IDLE)");
         }
     } else {
-        if (s == STATE_RECORDING && g_app.via_hotkey)
+        if (s == STATE_RECORDING && g_app.via_hotkey) {
             rec_stop();
+        } else {
+            PTT_DBG("  -> KR ignored (state=%d via_hk=%d)",
+                    (int)s, g_app.via_hotkey);
+        }
     }
     return GDK_FILTER_REMOVE;
 }
